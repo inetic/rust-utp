@@ -189,6 +189,8 @@ pub struct UtpSocket {
 
     /// Used by `set_read_timeout`.
     user_read_timeout: i64,
+
+    state_packet: Option<Packet>,
 }
 
 impl UtpSocket {
@@ -236,6 +238,7 @@ impl UtpSocket {
             cwnd: INIT_CWND * MSS,
             max_retransmission_retries: MAX_RETRANSMISSION_RETRIES,
             user_read_timeout: 0,
+            state_packet: None,
         }
     }
 
@@ -288,11 +291,13 @@ impl UtpSocket {
         packet.set_connection_id(socket.receiver_connection_id);
         packet.set_seq_nr(socket.seq_nr);
 
-        let mut len = 0;
         let mut buf = [0; BUF_SIZE];
-
         let mut syn_timeout = socket.congestion_timeout;
-        for _ in 0..MAX_SYN_RETRIES {
+        let mut syn_retries = 0;
+
+        loop {
+            if syn_retries >= MAX_SYN_RETRIES { break; }
+
             packet.set_timestamp_microseconds(now_microseconds());
 
             // Send packet
@@ -305,25 +310,34 @@ impl UtpSocket {
             socket.socket.set_read_timeout(Some(Duration::from_millis(syn_timeout)))
                 .expect("Error setting read timeout");
             match socket.socket.recv_from(&mut buf) {
-                Ok((read, src)) => { socket.connected_to = src; len = read; break; },
+                Ok((read, addr)) => {
+                    let packet = try!(Packet::from_bytes(&buf[..read]).or(Err(SocketError::InvalidPacket)));
+
+                    if packet.get_type() != PacketType::State {
+                        // The network might have dropped the `State` packet
+                        // from the peer, so we need to ask for it again.
+                        syn_retries += 1;
+                        continue;
+                    }
+
+                    socket.connected_to = addr;
+
+                    try!(socket.handle_packet(&packet, addr));
+
+                    return Ok(socket);
+                },
                 Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
                                e.kind() == ErrorKind::TimedOut) => {
                     debug!("Timed out, retrying");
                     syn_timeout *= 2;
+                    syn_retries += 1;
                     continue;
                 },
                 Err(e) => return Err(e),
             };
         }
 
-        let addr = socket.connected_to;
-        let packet = try!(Packet::from_bytes(&buf[..len]).or(Err(SocketError::InvalidPacket)));
-        debug!("received {:?}", packet);
-        try!(socket.handle_packet(&packet, addr));
-
-        debug!("connected to: {}", socket.connected_to);
-
-        return Ok(socket);
+        Err(Error::from(SocketError::ConnectionTimedOut))
     }
 
     /// If you have already prepared UDP sockets at each end (e.g. you're doing
@@ -1015,13 +1029,14 @@ impl UtpSocket {
                 self.state = SocketState::Connected;
                 self.last_dropped = self.ack_nr;
 
-                Ok(Some(self.prepare_reply(packet, PacketType::State)))
+                self.state_packet = Some(self.prepare_reply(packet, PacketType::State));
+                Ok(self.state_packet.clone())
             },
             (SocketState::Connected, PacketType::Syn) if self.connected_to == src => {
                 // The other end might have sent another Syn packet because
                 // a reply to the first one did not arrive within a timeout
                 // caused by network congestion.
-                Ok(None)
+                Ok(self.state_packet.clone())
             },
             (_, PacketType::Syn) => {
                 Ok(Some(self.prepare_reply(packet, PacketType::Reset)))
@@ -2929,6 +2944,7 @@ mod test {
         let mut server = iotry!(listener.accept()).0;
 
         assert_eq!(iotry!(server.send_to(&TX_BUF)), TX_BUF.len());
+        let _ = server.flush();
 
         assert!(client_t.join().is_ok());
     }
